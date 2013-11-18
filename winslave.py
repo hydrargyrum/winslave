@@ -92,7 +92,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 			return True
 
 	def enforce_file(self, path):
-		props = os.stat(path)
+		props = os.lstat(path)
 		if not stat.S_ISREG(props.st_mode):
 			self.send_error(403)
 			return False
