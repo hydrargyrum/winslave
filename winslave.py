@@ -1,3 +1,38 @@
+#!/usr/bin/env python
+# license: WTFPLv2 [http://wtfpl.net]
+
+# + el-cheapo HTTPS server to read/write files and run commands
+# + certificate-based whitelist client authentication
+# + ACL in INI configuration, default is to deny
+# - no commonName-to-IP match verification
+
+# CONFIG
+# [foo.local] # commonName of certificate
+# read_file=True # default=0
+# write_file=False # default=0
+# fs_root=~/files # default=~, path under which read/write are
+# exec_shell=False # default=False
+# exec_command=True # default=False
+# command_root=~/bin # default=~/bin, path under which commands are found
+
+# PROTOCOL
+# only HTTPS
+# read file: GET /fs/ANY_PATH_UNDER_FS_ROOT
+# write file: PUT /fs/ANY_PATH_UNDER_FS_ROOT [file data as body]
+# shell exec: POST /fs/exec_shell [all commands as body]
+# run a command: POST /fs/exec_command/COMMAND?ARGS%20ESCAPED [stdin data as body]
+
+# CLIENT SAMPLE
+# curl -E client-private-key.pem --cacert server-public-key.pem https://server:9000/fs/file.txt
+
+# SECURITY
+# clients public certificates must be in a file.pem given to the server, else clients are rejected
+# ACL.ini grants rights to the whitelisted certificates, default is deny all
+# "exec_shell=True" is *very* dangerous, and is equivalent to grant read and write
+# "command_root" is the path where to find the only binaries allowed for "exec_command" (not "exec_shell")
+# programs under command_root must be very secure, not allow arbitrary paths to be accessed, and avoid following/writing any symlink at all
+# best-effort is done to sanitize input, but security is without warranty, judge by yourself and deny access as much as possible
+
 
 from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
 from SocketServer import ThreadingMixIn
