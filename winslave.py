@@ -4,7 +4,6 @@ from SocketServer import ThreadingMixIn
 import ssl
 from urlparse import urlparse
 import urllib
-from decorator import decorator
 import os
 import sys
 import shutil
@@ -12,6 +11,7 @@ import stat
 import subprocess
 import optparse
 import shlex
+from ConfigParser import RawConfigParser
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer, object):
@@ -28,37 +28,23 @@ class SSLThreadedHTTPServer(ThreadedHTTPServer):
 
 
 class ServerWithPermissions(SSLThreadedHTTPServer):
-	ACL = {'localhost': {'read_file': True, 'write_file': True, 'exec_command': True, 'fs_root': '/', 'command_root': '~/bin', 'exec_shell': False}}
+	def __init__(self, *args, **kwargs):
+		self.acl = kwargs.pop('acl')
+		super(ServerWithPermissions, self).__init__(*args, **kwargs)
 
 	def finish_request(self, request, address):
 		name = transform_subject_dict(request.getpeercert())['subject']['commonName']
-		acl = self.ACL.get(name)
+		acl = self.acl.get(name)
 		if not acl:
 			return
 		self.RequestHandlerClass(request, address, self, acl=acl)
 
-
-@decorator
-def with_auth(func, *args, **kw):
-	self = args[0]
-	if not self.enforce_auth():
-		return
-	return func(*args, **kw)
 
 class RequestHandler(BaseHTTPRequestHandler):
 	def __init__(self, *a, **kw):
 		self.acl = kw.pop('acl')
 		BaseHTTPRequestHandler.__init__(self, *a, **kw)
 
-	# helper
-	def enforce_auth(self):
-		if self.headers.get('Authorization') == 'Basic Zm9vOmJhcg==':
-			return True
-		else:
-			self.send_error(401)
-			return False
-
-	@with_auth
 	def do_GET(self):
 		if self.path.startswith('/fs/'):
 			path = urlparse(self.path[4:]).path
@@ -66,7 +52,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 		else:
 			self.send_error(404)
 
-	@with_auth
 	def do_PUT(self):
 		if self.path.startswith('/fs/'):
 			path = urlparse(self.path[4:]).path
@@ -74,7 +59,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 		else:
 			self.send_error(404)
 
-	@with_auth
 	def do_POST(self):
 		if self.path == '/exec_shell':
 			self.exec_shell()
@@ -146,7 +130,10 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 		if not self.enforce_path_permission(path, 'r'):
 			return
-		if not self.enforce_file(path):
+		elif not self.enforce_file(path):
+			return
+		elif not self.acl.get('read_file', False):
+			self.send_error(403)
 			return
 
 		self.send_response(200) # Date+If-Modified-Since?
@@ -164,7 +151,10 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 		if not self.enforce_path_permission(path, 'w'):
 			return
-		if os.path.exists(path) and not self.enforce_file(path):
+		elif os.path.exists(path) and not self.enforce_file(path):
+			return
+		elif not self.acl.get('write_file', False):
+			self.send_error(403)
 			return
 
 		with file(path, 'wb') as f:
@@ -218,21 +208,49 @@ def transform_subject_dict(o):
 		o['subject'].update(dict(t))
 	return o
 
+def read_acl(filename):
+	def get(section, option, default, method='get'):
+		if config.has_option(section, option):
+			return getattr(config, method)(section, option)
+		else:
+			return default
+
+	getbool = lambda s, o, d: get(s, o, d, 'getboolean')
+
+	config = RawConfigParser()
+	config.read([filename])
+
+	acl = {}
+	for section in config.sections():
+		name = get(section, 'commonName', section)
+		acl[name] = {}
+		acl[name]['read_file'] = getbool(section, 'read_file', False)
+		acl[name]['write_file'] = getbool(section, 'write_file', False)
+		acl[name]['fs_root'] = get(section, 'fs_root', None)
+		acl[name]['exec_shell'] = getbool(section, 'exec_shell', False)
+		acl[name]['exec_command'] = getbool(section, 'exec_command', False)
+		acl[name]['command_root'] = get(section, 'command_root', None)
+
+	return acl
+
 def main():
 	parser = optparse.OptionParser()
 	parser.add_option('-k', '--server-certificate', dest='s_cert', metavar='SERVER_KEY.PEM')
 	parser.add_option('-c', '--client-certificate', dest='c_cert', metavar='CLIENTS_PUB_CERT.PEM')
 	parser.add_option('-p', '--port', dest='port', type=int, metavar='PORT')
 	parser.add_option('-b', '--bind', dest='bind', metavar='ADDRESS')
-	parser.set_defaults(port=9000, bind='')
+	parser.add_option('-a', '--acl-file', dest='acl_file', metavar='FILE')
+	parser.set_defaults(port=9000, bind='', acl_file='')
 	opts, args = parser.parse_args()
 
 	if not opts.s_cert or not opts.c_cert:
 		parser.error('Missing --server-certificate or --client-certificate')
+	if not opts.acl_file:
+		sys.stderr.write('Warning: no --acl-file, the server will deny everything\n')
+	acl = read_acl(opts.acl_file)
 
-	server = ServerWithPermissions((opts.bind, opts.port), RequestHandler, opts.s_cert, opts.c_cert)
+	server = ServerWithPermissions((opts.bind, opts.port), RequestHandler, opts.s_cert, opts.c_cert, acl=acl)
 	server.serve_forever()
-
 
 if __name__ == '__main__':
 	main()
