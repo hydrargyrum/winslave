@@ -4,6 +4,7 @@ from SocketServer import ThreadingMixIn
 import ssl
 from decorator import decorator
 import os
+import sys
 import shutil
 import stat
 import subprocess
@@ -15,13 +16,13 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer, object):
 
 
 class SSLThreadedHTTPServer(ThreadedHTTPServer):
-	def __init__(self, address, handler_class):
+	def __init__(self, address, handler_class, s_cert, c_cert):
 		super(SSLThreadedHTTPServer, self).__init__(address, handler_class, bind_and_activate=False)
 		self.old_socket = self.socket
-		#~ self.socket = ssl.wrap_socket(self.old_socket, certfile='priv.pem', server_side=True)
-		self.socket = ssl.wrap_socket(self.old_socket, certfile='priv.pem', server_side=True, cert_reqs=ssl.CERT_REQUIRED, ca_certs='client-pub.pem')
+		self.socket = ssl.wrap_socket(self.old_socket, certfile=s_cert, server_side=True, cert_reqs=ssl.CERT_REQUIRED, ca_certs=c_cert)
 		self.server_bind()
 		self.server_activate()
+
 
 @decorator
 def with_auth(func, *args, **kw):
@@ -145,8 +146,22 @@ class RequestHandler(BaseHTTPRequestHandler):
 		proc.wait()
 
 
-#~ server = ThreadedHTTPServer(('localhost', 9000), RequestHandler)
-server = SSLThreadedHTTPServer(('localhost', 9000), RequestHandler)
-server.serve_forever()
+def main():
+	parser = optparse.OptionParser()
+	parser.add_option('-k', '--server-certificate', dest='s_cert', metavar='SERVER_KEY.PEM')
+	parser.add_option('-c', '--client-certificate', dest='c_cert', metavar='CLIENTS_PUB_CERT.PEM')
+	parser.add_option('-p', '--port', dest='port', type=int, metavar='PORT')
+	parser.add_option('-b', '--bind', dest='bind', metavar='ADDRESS')
+	parser.set_defaults(port=9000, bind='')
+	opts, args = parser.parse_args()
+
+	if not opts.s_cert or not opts.c_cert:
+		parser.error('Missing --server-certificate or --client-certificate')
+
+	server = SSLThreadedHTTPServer((opts.bind, opts.port), RequestHandler, opts.s_cert, opts.c_cert)
+	server.serve_forever()
+
+if __name__ == '__main__':
+	main()
 
 # curl -d @- https://localhost:9000/exec --cacert /tmp/pub.pem -E client-priv.pem -u foo:bar -v <<< 'ls /tmp'
