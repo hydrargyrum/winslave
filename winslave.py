@@ -2,6 +2,8 @@
 from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
 from SocketServer import ThreadingMixIn
 import ssl
+from urlparse import urlparse
+import urllib
 from decorator import decorator
 import os
 import sys
@@ -9,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import optparse
+import shlex
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer, object):
@@ -24,6 +27,17 @@ class SSLThreadedHTTPServer(ThreadedHTTPServer):
 		self.server_activate()
 
 
+class ServerWithPermissions(SSLThreadedHTTPServer):
+	ACL = {'localhost': {'read_file': True, 'write_file': True, 'exec_command': True, 'fs_root': '/', 'command_root': '~/bin', 'exec_shell': False}}
+
+	def finish_request(self, request, address):
+		name = transform_subject_dict(request.getpeercert())['subject']['commonName']
+		acl = self.ACL.get(name)
+		if not acl:
+			return
+		self.RequestHandlerClass(request, address, self, acl=acl)
+
+
 @decorator
 def with_auth(func, *args, **kw):
 	self = args[0]
@@ -32,6 +46,10 @@ def with_auth(func, *args, **kw):
 	return func(*args, **kw)
 
 class RequestHandler(BaseHTTPRequestHandler):
+	def __init__(self, *a, **kw):
+		self.acl = kw.pop('acl')
+		BaseHTTPRequestHandler.__init__(self, *a, **kw)
+
 	# helper
 	def enforce_auth(self):
 		if self.headers.get('Authorization') == 'Basic Zm9vOmJhcg==':
@@ -43,26 +61,36 @@ class RequestHandler(BaseHTTPRequestHandler):
 	@with_auth
 	def do_GET(self):
 		if self.path.startswith('/fs/'):
-			return self.read_file(self.path[4:])
+			path = urlparse(self.path[4:]).path
+			return self.read_file(path)
 		else:
 			self.send_error(404)
 
 	@with_auth
 	def do_PUT(self):
 		if self.path.startswith('/fs/'):
-			return self.write_file(self.path[4:])
+			path = urlparse(self.path[4:]).path
+			return self.write_file(path)
 		else:
 			self.send_error(404)
 
 	@with_auth
 	def do_POST(self):
-		if self.path == '/exec':
-			self.exec_command()
+		if self.path == '/exec_shell':
+			self.exec_shell()
+		elif self.path.startswith('/exec_command/'):
+			command, args = self._command_and_args(self.path[len('/exec_command/'):])
+			self.exec_command(command, args)
 		else:
 			self.send_error(404)
 
+	def _command_and_args(self, path):
+		command = urlparse(path).path
+		args = shlex.split(urllib.unquote(urlparse(path).query))
+		return (command, args)
+
 	def allowed_path(self, path):
-		return True
+		return path.startswith(self._fs_root())
 
 	def _oth_perm(self, path, perm):
 		# very useless, as /exec can be used to circumvent that
@@ -99,8 +127,22 @@ class RequestHandler(BaseHTTPRequestHandler):
 		else:
 			return True
 
+	def _fs_root(self):
+		return os.path.expanduser(self.acl.get('fs_root') or '~')
+
+	def _fs_path(self, path):
+		path = os.path.normpath(path).lstrip('/')
+		return os.path.realpath(os.path.join(self._fs_root(), path))
+	
+	def _command_root(self):
+		return os.path.expanduser(self.acl.get('command_root') or '~/bin')
+	
+	def _command_path(self, path):
+		path = os.path.normpath(path).lstrip('/')
+		return os.path.realpath(os.path.join(self._command_root(), path))
+
 	def read_file(self, path):
-		path = os.path.realpath('/%s' % path)
+		path = self._fs_path(path)
 
 		if not self.enforce_path_permission(path, 'r'):
 			return
@@ -118,7 +160,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 			shutil.copyfileobj(f, self.wfile)
 
 	def write_file(self, path):
-		path = os.path.realpath('/%s' % path)
+		path = self._fs_path(path)
 
 		if not self.enforce_path_permission(path, 'w'):
 			return
@@ -135,7 +177,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 				sz -= len(buf)
 		self.send_error(201)
 
-	def exec_command(self):
+	def exec_shell(self):
+		if not self.acl.get('exec_shell', False):
+			self.send_error(403)
+			return
+
 		self.send_response(200)
 		self.end_headers()
 		src = self.rfile.read(int(self.headers.get('Content-Length', 0)))
@@ -145,6 +191,32 @@ class RequestHandler(BaseHTTPRequestHandler):
 		shutil.copyfileobj(proc.stdout, self.wfile)
 		proc.wait()
 
+	def exec_command(self, command, args):
+		if not self.acl.get('exec_command', False):
+			self.send_error(403)
+			return
+
+		command = self._command_path(command)
+		if not command.startswith(self._command_root()):
+			self.send_error(403)
+			return
+
+		self.send_response(200)
+		self.end_headers()
+		proc = subprocess.Popen([command] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+		src = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+		proc.stdin.write(src)
+		proc.stdin.close()
+		shutil.copyfileobj(proc.stdout, self.wfile)
+		proc.wait()
+
+
+def transform_subject_dict(o):
+	tuples = o['subject']
+	o['subject'] = {}
+	for t in tuples:
+		o['subject'].update(dict(t))
+	return o
 
 def main():
 	parser = optparse.OptionParser()
@@ -158,10 +230,9 @@ def main():
 	if not opts.s_cert or not opts.c_cert:
 		parser.error('Missing --server-certificate or --client-certificate')
 
-	server = SSLThreadedHTTPServer((opts.bind, opts.port), RequestHandler, opts.s_cert, opts.c_cert)
+	server = ServerWithPermissions((opts.bind, opts.port), RequestHandler, opts.s_cert, opts.c_cert)
 	server.serve_forever()
+
 
 if __name__ == '__main__':
 	main()
-
-# curl -d @- https://localhost:9000/exec --cacert /tmp/pub.pem -E client-priv.pem -u foo:bar -v <<< 'ls /tmp'
